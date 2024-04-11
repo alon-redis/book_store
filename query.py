@@ -3,6 +3,7 @@ import redis
 import json
 import random
 import time
+import logging
 import threading
 from faker import Faker
 from concurrent.futures import ThreadPoolExecutor
@@ -54,9 +55,14 @@ def execute_queries(r, duration):
         lambda: r.ft(INDEX_NAME).aggregate(aggregations.AggregateRequest(fake.word()).sort_by("@weight_grams")),
         lambda: r.ft(INDEX_NAME).search(Query(fake.word()).add_filter(NumericFilter("rating_votes", 900, 1000)))
         ]
-        random.choice(commands)()
-        commands_executed += 1
-    print(f"Random commands executed: {commands_executed}")
+        try:
+            random.choice(commands)()
+            commands_executed += 1
+        except redis.exceptions.ResponseError as e:
+            logging.error(f"Redis ResponseError during command execution: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+    logging.info(f"Random commands executed: {commands_executed}")
 
 def main():
     arg_parser = argparse.ArgumentParser(description="Running the book store application")
@@ -72,6 +78,10 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [executor.submit(execute_queries, r, args.duration) for _ in range(args.workers)]
         for future in futures:
-            future.result()  # Waiting for all threads to complete
+            try:
+                future.result()  # Waiting for all threads to complete
+            except Exception as e:
+                logging.error(f"Error in thread execution: {e}")
+
 if __name__ == "__main__":
     main()
