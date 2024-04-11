@@ -16,14 +16,14 @@ from redis.commands.search.field import TextField, TagField, NumericField
 from redis.commands.search.query import NumericFilter, Query
 from redis.commands.search.aggregation import AggregateRequest
 
+# Setup basic logging
+#logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Define constants
 REDIS_KEY_BASE = "alon:shmuely:redis:data:store:application"
 INDEX_NAME = "idx:books"
 
 fake = Faker()
-
-#def make_key(book_id):
-#    return f"{REDIS_KEY_BASE}:{book_id}"
 
 def create_redis_connection_pool(redis_url, max_connections):
     return redis.ConnectionPool.from_url(redis_url, max_connections=max_connections)
@@ -40,6 +40,7 @@ def index_exists(r, index_name):
 
 def execute_queries(r, duration):
     start_time = time.time()
+    command = None  # Define command outside the loop to ensure it's accessible for logging in case of error
     commands_executed = 0
     while (time.time() - start_time) < duration:
         commands = [
@@ -55,11 +56,12 @@ def execute_queries(r, duration):
         lambda: r.ft(INDEX_NAME).aggregate(aggregations.AggregateRequest(fake.word()).sort_by("@weight_grams")),
         lambda: r.ft(INDEX_NAME).search(Query(fake.word()).add_filter(NumericFilter("rating_votes", 900, 1000)))
         ]
+        command = random.choice(commands)
         try:
-            random.choice(commands)()
+            command()
             commands_executed += 1
         except redis.exceptions.ResponseError as e:
-            logging.error(f"Redis ResponseError during command execution: {e}")
+            logging.error(f"Redis ResponseError during command execution: {e}. Command: {command.__name__}, Query: {query}")
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
     logging.info(f"Random commands executed: {commands_executed}")
