@@ -93,6 +93,7 @@ def create_search_index(connection_pool):
                     TextField("$.book_series", as_name="book_series", sortable=True),
                     TextField("$.main_character", as_name="main_character", sortable=True),
                     TextField("$.location", as_name="location", sortable=True),
+                    TextField("$.address", as_name="address", sortable=True),
                     NumericField("$.edition_number", as_name="edition_number", sortable=True),
                     NumericField("$.chapter_count", as_name="chapter_count", sortable=True),
                     NumericField("$.review_count", as_name="review_count", sortable=True),
