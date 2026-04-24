@@ -93,9 +93,13 @@ def q_faceted_fuzzy_search() -> Callable[[redis.Redis], object]:
                 "-@author:\"Alon Shmuely\""
             )
             .return_fields(
-                "title", "author", "score", "price",
+                "title", "author", "price",
                 "year_published", "genres", "description",
             )
+            # Alias the @score index field to "book_score" so it does not
+            # collide with the document score produced by WITHSCORES
+            # (redis-py's Document ctor raises TypeError on that clash).
+            .return_field("score", as_field="book_score")
             .summarize(fields=["description"], context_len=15,
                        num_frags=2, sep=" ... ")
             .highlight(fields=["title", "description"], tags=("<b>", "</b>"))
