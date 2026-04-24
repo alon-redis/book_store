@@ -23,6 +23,9 @@ Usage examples
     python queryGenerator.py --connections 50 --duration 30 \
                              --total-queries 500000
 
+    # Test mode: run each query once and print results:
+    python queryGenerator.py --host 127.0.0.1 --port 6379 --test-mode
+
 The script aims for maximum throughput:
   * one shared :class:`redis.ConnectionPool` sized to ``--connections``
   * a :class:`ThreadPoolExecutor` with ``--connections`` workers, each
@@ -305,16 +308,207 @@ def q_agg_reading_efficiency() -> Callable[[redis.Redis], object]:
     return run
 
 
+def q_parameterized_price_window() -> Callable[[redis.Redis], object]:
+    """Parameterized FT.SEARCH with $params binding and DIALECT 2."""
+
+    def run(r: redis.Redis):
+        lo = random.randint(1900, 1990)
+        hi = lo + random.randint(5, 40)
+        min_score = round(random.uniform(2.5, 4.5), 2)
+        max_price = random.choice([20, 35, 50, 75, 100])
+        q = (
+            Query(
+                "(@year_published:[$lo $hi]) "
+                "(@score:[$min_score +inf]) "
+                "(@price:[-inf ($max_price]) "
+                "(@is_available:{True})"
+            )
+            .return_fields("title", "author", "year_published",
+                           "score", "price")
+            .sort_by("year_published", asc=True)
+            .paging(0, 50)
+            .dialect(2)
+        )
+        params = {
+            "lo": lo,
+            "hi": hi,
+            "min_score": min_score,
+            "max_price": max_price,
+        }
+        return r.ft(INDEX_NAME).search(q, query_params=params).docs
+
+    return run
+
+
+def q_prefix_suffix_infix_text() -> Callable[[redis.Redis], object]:
+    """Prefix / suffix / infix wildcard TEXT matching with VERBATIM."""
+
+    def run(r: redis.Redis):
+        prefix = fake.lexify(text="???").lower()
+        infix = fake.lexify(text="??").lower()
+        suffix = fake.lexify(text="??").lower()
+        q = (
+            Query(
+                f"(@title:{prefix}*) "
+                f"(@description:*{infix}*) "
+                f"(@author:*{suffix}) "
+                f"(@is_available:{{True}})"
+            )
+            .verbatim()
+            .return_fields("title", "author", "description")
+            .paging(0, 20)
+            .dialect(2)
+        )
+        return r.ft(INDEX_NAME).search(q).docs
+
+    return run
+
+
+def q_negative_heavy_search() -> Callable[[redis.Redis], object]:
+    """Negation-heavy query: exclude genres, statuses, formats, keywords."""
+
+    def run(r: redis.Redis):
+        q = (
+            Query(
+                "(@is_available:{True}) "
+                "-(@genres:{horror|true\\ crime}) "
+                "-(@status:{maintenance|on_loan}) "
+                "-(@format:{ebook}) "
+                "-(@description:(violence|gore)) "
+                "-@author:\"Alon Shmuely\" "
+                "(@rating_votes:[50 +inf]) "
+                "(@score:[3 +inf])"
+            )
+            .return_fields("title", "author", "genres",
+                           "format", "score", "rating_votes")
+            .sort_by("rating_votes", asc=False)
+            .paging(0, 40)
+            .dialect(2)
+        )
+        return r.ft(INDEX_NAME).search(q).docs
+
+    return run
+
+
+def q_agg_author_distinct_genres() -> Callable[[redis.Redis], object]:
+    """Author versatility: distinct genres/editions + date-formatted activity."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@is_available:{True})")
+            .load("@author", "@timestamp")
+            .apply(last_active="timefmt(@timestamp, \"%Y-%m\")")
+            .group_by(
+                ["@author"],
+                reducers.count().alias("books"),
+                reducers.count_distinct("@genres").alias("distinct_genres"),
+                reducers.count_distinctish("@editions")
+                        .alias("distinct_editions_approx"),
+                reducers.max("@timestamp").alias("last_ts"),
+                reducers.tolist("@last_active").alias("active_months"),
+                reducers.avg("@score").alias("avg_score"),
+            )
+            .apply(
+                last_active_str="timefmt(@last_ts, \"%Y-%m-%d\")"
+            )
+            .filter("@books >= 2 && @distinct_genres >= 2")
+            .sort_by(aggregations.Desc("@distinct_genres"),
+                     aggregations.Desc("@books"))
+            .limit(0, 50)
+            .dialect(2)
+        )
+        return r.ft(INDEX_NAME).aggregate(req).rows
+
+    return run
+
+
+def q_agg_price_per_page_leaders() -> Callable[[redis.Redis], object]:
+    """Value-for-money leaderboard: price/page, citation/review, size vs weight."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest(
+                "(@is_available:{True}) (@pages:[(0 +inf]) "
+                "(@review_count:[(0 +inf])"
+            )
+            .load("@title", "@author", "@price", "@pages",
+                  "@citation_count", "@review_count", "@weight_grams",
+                  "@width_cm", "@height_cm", "@depth_cm")
+            .apply(price_per_page="@price / @pages")
+            .apply(citation_ratio="@citation_count / @review_count")
+            .apply(volume_cm3="@width_cm * @height_cm * @depth_cm")
+            .apply(density_g_cm3="@weight_grams / @volume_cm3")
+            .filter("@price_per_page > 0 && @volume_cm3 > 0")
+            .group_by(
+                ["@author"],
+                reducers.count().alias("books"),
+                reducers.avg("@price_per_page").alias("avg_ppp"),
+                reducers.quantile("@price_per_page", 0.5)
+                        .alias("median_ppp"),
+                reducers.avg("@citation_ratio").alias("avg_citation_ratio"),
+                reducers.avg("@density_g_cm3").alias("avg_density"),
+                reducers.first_value(
+                    "@title", aggregations.Asc("@price_per_page")
+                ).alias("cheapest_title"),
+            )
+            .filter("@books >= 2")
+            .sort_by(aggregations.Asc("@median_ppp"))
+            .limit(0, 25)
+            .dialect(2)
+        )
+        return r.ft(INDEX_NAME).aggregate(req).rows
+
+    return run
+
+
+def q_agg_inventory_status_funnel() -> Callable[[redis.Redis], object]:
+    """Inventory funnel per format: counts per status with string formatting."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@format", "@status", "@price", "@title")
+            .apply(fmt_up="upper(@format)")
+            .apply(status_lc="lower(@status)")
+            .group_by(
+                ["@fmt_up", "@status_lc"],
+                reducers.count().alias("count"),
+                reducers.avg("@price").alias("avg_price"),
+                reducers.min("@price").alias("min_price"),
+                reducers.max("@price").alias("max_price"),
+                reducers.random_sample("@title", 3).alias("samples"),
+            )
+            .apply(
+                summary="format("
+                        "\"%s/%s: %d books, avg $%.2f\", "
+                        "@fmt_up, @status_lc, @count, @avg_price)"
+            )
+            .sort_by(aggregations.Asc("@fmt_up"),
+                     aggregations.Desc("@count"))
+            .limit(0, 40)
+            .dialect(2)
+        )
+        return r.ft(INDEX_NAME).aggregate(req).rows
+
+    return run
+
+
 # The full pool of query factories the generator will cycle through.
 ALL_QUERIES: List[Callable[[], Callable[[redis.Redis], object]]] = [
     q_faceted_fuzzy_search,
     q_multi_tag_geo_search,
     q_optional_boost_search,
     q_geo_radius_sorted,
+    q_parameterized_price_window,
+    q_prefix_suffix_infix_text,
+    q_negative_heavy_search,
     q_agg_author_productivity,
     q_agg_geo_distance_buckets,
     q_agg_publisher_leaderboard,
     q_agg_reading_efficiency,
+    q_agg_author_distinct_genres,
+    q_agg_price_per_page_leaders,
+    q_agg_inventory_status_funnel,
 ]
 
 
@@ -487,6 +681,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                       help="Live status refresh interval in seconds "
                            "(default: 1.0). Use 0 to disable.")
 
+    test = p.add_argument_group("Test mode")
+    test.add_argument("--test-mode", action="store_true",
+                      help="Run each query exactly once, sequentially, "
+                           "and print its results. Ignores --connections "
+                           "/ --total-queries / --duration.")
+    test.add_argument("--test-max-rows", type=int, default=5,
+                      help="In --test-mode, max rows/docs to print per "
+                           "query (default: 5). Use 0 for unlimited.")
+
     return p.parse_args(argv)
 
 
@@ -530,12 +733,117 @@ def print_summary(total: WorkerStats, elapsed: float,
             print(f"  {name:<30s} {count:>10d}")
 
 
+def _fmt_value(v, max_len: int = 200) -> str:
+    """Pretty-format an individual cell value for test-mode output."""
+
+    if isinstance(v, bytes):
+        try:
+            v = v.decode("utf-8", errors="replace")
+        except Exception:
+            v = repr(v)
+    s = str(v)
+    if len(s) > max_len:
+        s = s[: max_len - 3] + "..."
+    return s
+
+
+def _print_test_result(name: str, doc_help: Optional[str],
+                       result, max_rows: int) -> None:
+    """Render the result of a single query for --test-mode."""
+
+    header = f"### {name}"
+    if doc_help:
+        header += f" -- {doc_help.strip().splitlines()[0]}"
+    print("\n" + "=" * 78)
+    print(header)
+    print("=" * 78)
+
+    if result is None:
+        print("(no result)")
+        return
+
+    # ``result`` is either a list of Document objects (FT.SEARCH .docs) or
+    # a list of aggregate rows (list/dict/tuple).
+    if not isinstance(result, list):
+        print(_fmt_value(result, 400))
+        return
+
+    print(f"rows returned : {len(result)}")
+    if max_rows and len(result) > max_rows:
+        print(f"showing first : {max_rows}")
+        items = result[:max_rows]
+    else:
+        items = result
+
+    for i, row in enumerate(items, 1):
+        print(f"\n[{i}]")
+        if hasattr(row, "__dict__"):
+            payload = {
+                k: v for k, v in row.__dict__.items()
+                if not k.startswith("_")
+            }
+            for k in sorted(payload):
+                print(f"  {k:<24s} = {_fmt_value(payload[k])}")
+        elif isinstance(row, dict):
+            for k in sorted(row):
+                print(f"  {str(k):<24s} = {_fmt_value(row[k])}")
+        elif isinstance(row, (list, tuple)):
+            # Aggregate rows from redis-py come back as flat [k, v, k, v, ...]
+            # lists; show them as key/value pairs when that shape fits.
+            if len(row) % 2 == 0 and all(
+                isinstance(x, (str, bytes)) for x in row[::2]
+            ):
+                for k, v in zip(row[::2], row[1::2]):
+                    key = k.decode() if isinstance(k, bytes) else str(k)
+                    print(f"  {key:<24s} = {_fmt_value(v)}")
+            else:
+                for j, v in enumerate(row):
+                    print(f"  [{j}] {_fmt_value(v)}")
+        else:
+            print(f"  {_fmt_value(row)}")
+
+
+def run_test_mode(pool: redis.ConnectionPool, max_rows: int) -> int:
+    """Run every query factory exactly once and print the results."""
+
+    r = redis.Redis(connection_pool=pool)
+    print(f"Running {len(ALL_QUERIES)} queries once each against "
+          f"index '{INDEX_NAME}' (test-mode)")
+
+    failures = 0
+    for factory in ALL_QUERIES:
+        name = factory.__name__
+        doc = factory.__doc__
+        op = factory()
+        t0 = time.perf_counter()
+        try:
+            result = op(r)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            _print_test_result(name, doc, result, max_rows)
+            print(f"\n(elapsed: {elapsed_ms:.2f} ms)")
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            print("\n" + "=" * 78)
+            print(f"### {name} -- FAILED after {elapsed_ms:.2f} ms")
+            print("=" * 78)
+            print(f"{type(e).__name__}: {e}")
+
+    print("\n" + "=" * 78)
+    print(f"test-mode done: {len(ALL_QUERIES) - failures} ok, "
+          f"{failures} failed")
+    print("=" * 78)
+    return 0 if failures == 0 else 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
-    if args.total_queries is None and args.duration is None:
+    if not args.test_mode and args.total_queries is None \
+            and args.duration is None:
         print(
-            "error: you must specify --total-queries and/or --duration",
+            "error: you must specify --total-queries and/or --duration "
+            "(or use --test-mode)",
             file=sys.stderr,
         )
         return 2
@@ -552,6 +860,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except redis.exceptions.RedisError as e:
         print(f"error: cannot connect to Redis: {e}", file=sys.stderr)
         return 1
+
+    if args.test_mode:
+        return run_test_mode(pool, args.test_max_rows)
 
     state = GlobalState(total_queries=args.total_queries)
 
