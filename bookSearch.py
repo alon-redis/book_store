@@ -51,76 +51,137 @@ def make_key(book_id):
 def create_redis_connection_pool(redis_url, max_connections):
     return redis.ConnectionPool.from_url(redis_url, max_connections=max_connections)
 
-def index_exists(connection_pool, index_name):
+def get_index_info(connection_pool, index_name):
     try:
         r = redis.Redis(connection_pool=connection_pool)
-        index_info = r.ft(index_name).info()
-        if index_info:
-            print(f"Search index '{index_name}' already exists.")
-            return True
-        else:
-            print(f"Search index '{index_name}' does not exist. Creating it now...")
-            create_search_index(connection_pool)
-            return True
+        return r.ft(index_name).info()
     except redis.exceptions.ResponseError as e:
-       print(f"Error: {str(e)}")
-       return False
+       if "Unknown Index name" in str(e):
+           return None
+       raise
     except redis.exceptions.ConnectionError as e:
        print(f"Failed to check index existence. Error: {str(e)}")
-       return False
+       return None
 
-def create_search_index(connection_pool):
+def normalize_geo_value(geo_value):
+    if not isinstance(geo_value, str):
+        return geo_value
+
+    longitude_latitude = [part.strip() for part in geo_value.split(",", 1)]
+    if len(longitude_latitude) != 2:
+        return geo_value
+
+    return f"{longitude_latitude[0]},{longitude_latitude[1]}"
+
+def normalize_book_data(book_data):
+    normalized_book = dict(book_data)
+    changed = False
+
+    normalized_geo = normalize_geo_value(normalized_book.get("geo"))
+    if normalized_geo != normalized_book.get("geo"):
+        normalized_book["geo"] = normalized_geo
+        changed = True
+
+    is_available = normalized_book.get("is_available")
+    if isinstance(is_available, bool):
+        normalized_book["is_available"] = str(is_available).lower()
+        changed = True
+
+    return normalized_book, changed
+
+def drop_search_index(connection_pool):
+    r = redis.Redis(connection_pool=connection_pool)
+
     try:
-        r = redis.Redis(connection_pool=connection_pool) 
-        if not index_exists(connection_pool, INDEX_NAME):
-            print("Creating search index.")
-            r.ft(INDEX_NAME).create_index(
-                [
-                    TextField("$.author", as_name="author", sortable=True),
-                    TagField("$.id", as_name="id", sortable=True),
-                    TextField("$.description", as_name="description", sortable=True), 
-                    TagField("$.editions[*]", as_name="editions", sortable=True),
-                    TagField("$.genres[*]", as_name="genres", sortable=True),
-                    NumericField("$.pages", as_name="pages", sortable=True),  
-                    TextField("$.title", as_name="title", sortable=True),
-                    NumericField("$.year_published", as_name="year_published", sortable=True),
-                    NumericField("$.metrics.rating_votes", as_name="rating_votes", sortable=True),
-                    NumericField("$.metrics.score", as_name="score", sortable=True),
-                    TagField("$.inventory[*].status", as_name="status", sortable=True),
-                    TagField("$.inventory[*].stock_id", as_name="stock_id", sortable=True),
-                    TagField("$.format", as_name="format", sortable=True),
-                    TagField("$.is_available", as_name="is_available", sortable=True), 
-                    NumericField("$.price", as_name="price", sortable=True),
-                    TagField("$.isbn", as_name="isbn", sortable=True), 
-                    redis.commands.search.field.GeoField("$.geo", as_name="geo", sortable=True),
-                    TextField("$.publisher", as_name="publisher", sortable=True),
-                    TextField("$.book_series", as_name="book_series", sortable=True),
-                    TextField("$.main_character", as_name="main_character", sortable=True),
-                    TextField("$.location", as_name="location", sortable=True),
-                    TextField("$.address", as_name="address", sortable=True),
-                    NumericField("$.edition_number", as_name="edition_number", sortable=True),
-                    NumericField("$.chapter_count", as_name="chapter_count", sortable=True),
-                    NumericField("$.review_count", as_name="review_count", sortable=True),
-                    NumericField("$.citation_count", as_name="citation_count", sortable=True),
-                    NumericField("$.publishing_delay", as_name="publishing_delay", sortable=True),
-                    NumericField("$.word_count", as_name="word_count", sortable=True),
-                    NumericField("$.timestamp", as_name="timestamp", sortable=True),                    
-                    NumericField("$.reading_time_minutes", as_name="reading_time_minutes", sortable=True),
-                    NumericField("$.global_sales", as_name="global_sales", sortable=True),
-                    NumericField("$.translations_count", as_name="translations_count", sortable=True),
-                    NumericField("$.author_age_at_publication", as_name="author_age_at_publication", sortable=True),
-                    NumericField("$.weight_grams", as_name="weight_grams", sortable=True),
-                    NumericField("$.dimensions.width_cm", as_name="width_cm", sortable=True), 
-                    NumericField("$.dimensions.height_cm", as_name="height_cm", sortable=True),
-                    NumericField("$.dimensions.depth_cm", as_name="depth_cm", sortable=True) 
-                ],
-                definition=IndexDefinition( 
-                    index_type=IndexType.JSON,  
-                    prefix=[f"{REDIS_KEY_BASE}:"]
-                )
+        r.ft(INDEX_NAME).dropindex(delete_documents=False)
+        print(f"Dropped search index '{INDEX_NAME}' without deleting JSON documents.")
+    except redis.exceptions.ResponseError as e:
+        if "Unknown Index name" not in str(e):
+            raise
+
+def write_book_json(r, book_id, book_data):
+    normalized_book_data, _ = normalize_book_data(book_data)
+    return r.json().set(make_key(book_id), Path.root_path(), normalized_book_data)
+
+def repair_existing_books(connection_pool):
+    r = redis.Redis(connection_pool=connection_pool)
+    checked_books = 0
+    repaired_books = 0
+
+    for key in r.scan_iter(match=f"{REDIS_KEY_BASE}:*"):
+        book_data = r.json().get(key)
+        if not isinstance(book_data, dict):
+            continue
+
+        checked_books += 1
+        normalized_book_data, changed = normalize_book_data(book_data)
+        if changed:
+            r.json().set(key, Path.root_path(), normalized_book_data)
+            repaired_books += 1
+
+    print(
+        f"Checked {checked_books} existing book documents and normalized "
+        f"{repaired_books} for indexing."
+    )
+
+def create_search_index(connection_pool, recreate=False):
+    try:
+        r = redis.Redis(connection_pool=connection_pool)
+        index_info = get_index_info(connection_pool, INDEX_NAME)
+
+        if index_info and not recreate:
+            print(f"Search index '{INDEX_NAME}' already exists.")
+            return
+
+        if recreate:
+            drop_search_index(connection_pool)
+
+        print("Creating search index.")
+        r.ft(INDEX_NAME).create_index(
+            [
+                TextField("$.author", as_name="author", sortable=True),
+                TagField("$.id", as_name="id", sortable=True),
+                TextField("$.description", as_name="description", sortable=True),
+                TagField("$.editions[*]", as_name="editions", sortable=True),
+                TagField("$.genres[*]", as_name="genres", sortable=True),
+                NumericField("$.pages", as_name="pages", sortable=True),
+                TextField("$.title", as_name="title", sortable=True),
+                NumericField("$.year_published", as_name="year_published", sortable=True),
+                NumericField("$.metrics.rating_votes", as_name="rating_votes", sortable=True),
+                NumericField("$.metrics.score", as_name="score", sortable=True),
+                TagField("$.inventory[*].status", as_name="status", sortable=True),
+                TagField("$.inventory[*].stock_id", as_name="stock_id", sortable=True),
+                TagField("$.format", as_name="format", sortable=True),
+                TagField("$.is_available", as_name="is_available", sortable=True),
+                NumericField("$.price", as_name="price", sortable=True),
+                TagField("$.isbn", as_name="isbn", sortable=True),
+                redis.commands.search.field.GeoField("$.geo", as_name="geo", sortable=True),
+                TextField("$.publisher", as_name="publisher", sortable=True),
+                TextField("$.book_series", as_name="book_series", sortable=True),
+                TextField("$.main_character", as_name="main_character", sortable=True),
+                TextField("$.location", as_name="location", sortable=True),
+                TextField("$.address", as_name="address", sortable=True),
+                NumericField("$.edition_number", as_name="edition_number", sortable=True),
+                NumericField("$.chapter_count", as_name="chapter_count", sortable=True),
+                NumericField("$.review_count", as_name="review_count", sortable=True),
+                NumericField("$.citation_count", as_name="citation_count", sortable=True),
+                NumericField("$.publishing_delay", as_name="publishing_delay", sortable=True),
+                NumericField("$.word_count", as_name="word_count", sortable=True),
+                NumericField("$.timestamp", as_name="timestamp", sortable=True),
+                NumericField("$.reading_time_minutes", as_name="reading_time_minutes", sortable=True),
+                NumericField("$.global_sales", as_name="global_sales", sortable=True),
+                NumericField("$.translations_count", as_name="translations_count", sortable=True),
+                NumericField("$.author_age_at_publication", as_name="author_age_at_publication", sortable=True),
+                NumericField("$.weight_grams", as_name="weight_grams", sortable=True),
+                NumericField("$.dimensions.width_cm", as_name="width_cm", sortable=True),
+                NumericField("$.dimensions.height_cm", as_name="height_cm", sortable=True),
+                NumericField("$.dimensions.depth_cm", as_name="depth_cm", sortable=True)
+            ],
+            definition=IndexDefinition(
+                index_type=IndexType.JSON,
+                prefix=[f"{REDIS_KEY_BASE}:"]
             )
-        else:
-            print("Search index already exists.")
+        )
     except redis.exceptions.ConnectionError as e:
         print(f"Failed to create search index. Error: {str(e)}")
 
@@ -146,11 +207,11 @@ def generate_random_book(id):
         "url": fake.url(),
         "year_published": random.randint(1900, 2023),
         "format": random.choice(["hardcover", "paperback", "ebook"]),
-        "is_available": random.choice([True, False]),
+        "is_available": random.choice(["true", "false"]),
         "price": round(random.uniform(5, 100), 2),
         "isbn": fake.isbn13(),
         "address": fake.address(),
-        "geo": f"{fake.longitude()}, {fake.latitude()}",
+        "geo": f"{fake.longitude()},{fake.latitude()}",
         "weight_grams": random.randint(-100, 2000),
         "dimensions": {
             "width_cm": round(random.uniform(10, 30), 2),
@@ -190,7 +251,7 @@ def write_data_verification(connection_pool):
        book_data['author'] = 'Alon Shmuely'
        book_data['title'] = 'QA architect'
        book_data['address'] = '98765 Ein Dor Apt. 0001 Rishon Lezion, IL 1948'
-       r.json().set("alon:shmuely:redis:data:store:application:" + str(0), Path.root_path(), book_data)
+       write_book_json(r, 0, book_data)
    except redis.exceptions.ConnectionError as e:
        print(f"Failed to write data verification. Error: {str(e)}")
        
@@ -264,7 +325,7 @@ def generating_books(connection_pool, max_books, max_random):
         for x in range(1, max_books + 1):
             book_id = random.randint(1, max_random)
             book_data = generate_random_book(book_id)
-            response = r.json().set("alon:shmuely:redis:data:store:application:" + str(book_id), Path.root_path(), book_data)
+            response = write_book_json(r, book_id, book_data)
             if response:
               SUCCESSFUL_WRITE += 1
             else:
@@ -279,6 +340,8 @@ if __name__ == "__main__":
     arg_parser.add_argument("--max-books", default=3000, type=int, dest="max_books", help="Maximum number of books")
     arg_parser.add_argument("--max-random", default=3000, type=int, dest="max_random", help="Maximum random number of books")
     arg_parser.add_argument("--flush", action='store_true', help="Flush the Redis database on startup")
+    arg_parser.add_argument("--recreate-index", action='store_true', help="Drop and recreate the search index without deleting JSON documents.")
+    arg_parser.add_argument("--repair-existing-docs", action='store_true', help="Normalize existing JSON documents so they can be indexed.")
     arg_parser.add_argument("--run-random-cmds", action='store_true', help="Run random commands thread")
     args = arg_parser.parse_args()
 
@@ -291,7 +354,9 @@ if __name__ == "__main__":
             r = redis.Redis(connection_pool=redis_pool)
             r.flushall()
 
-        create_search_index(redis_pool)
+        create_search_index(redis_pool, recreate=args.recreate_index)
+        if args.repair_existing_docs:
+            repair_existing_books(redis_pool)
         write_data_verification(redis_pool)
 
         # Create thread objects

@@ -44,6 +44,8 @@ python3 bookSearch.py [options]
 - `--max-books`: Number of books to generate (default: 3000)
 - `--max-random`: Upper bound for random book IDs (default: 3000)
 - `--flush`: Flush Redis database on startup
+- `--recreate-index`: Drop and recreate `idx:books` without deleting JSON documents
+- `--repair-existing-docs`: Rewrite existing JSON documents into indexable shapes for RediSearch
 - `--run-random-cmds`: Enable chaos testing with random commands
 
 ## Execution Flow
@@ -70,6 +72,12 @@ For the query stress tool, use:
 
 ```bash
 python3 bookQuery.py --redis-url redis://redis-server:6379
+```
+
+To repair an existing dataset after changing the indexable JSON field formats, run:
+
+```bash
+python3 bookSearch.py --redis redis://redis-server:6379 --recreate-index --repair-existing-docs --max-books 0
 ```
 
 ## Notes
