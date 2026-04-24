@@ -640,6 +640,490 @@ def q_agg_inventory_status_funnel() -> Callable[[redis.Redis], object]:
     return run
 
 
+PAGE_COUNT_DEFAULT = 50
+MAX_IDLE_DEFAULT = 10         # seconds; redis-py multiplies by 1000 -> ms
+MAX_PAGES_DEFAULT = 40        # hard cap so one call can't monopolize a worker
+
+
+def _drain_cursor(
+    ft,
+    r: redis.Redis,
+    req: AggregateRequest,
+    page_count: int = PAGE_COUNT_DEFAULT,
+    max_pages: int = MAX_PAGES_DEFAULT,
+) -> Dict[str, object]:
+    """Execute an aggregate with WITHCURSOR and drain the cursor.
+
+    On early exit (hard page cap or exception), explicitly issues
+    FT.CURSOR DEL so the cursor doesn't linger on the server until
+    MAXIDLE.
+
+    Returns ``{"pages", "cursor_id", "rows_total", "rows"}`` so
+    --test-mode can report drain metadata.
+    """
+
+    pages = 0
+    total_rows: List = []
+
+    result = ft.aggregate(req)
+    total_rows.extend(result.rows)
+    pages += 1
+    cursor = result.cursor
+    final_cid = cursor.cid if cursor is not None else 0
+
+    try:
+        while (
+            cursor is not None
+            and cursor.cid != 0
+            and pages < max_pages
+        ):
+            cursor.count = page_count
+            next_result = ft.aggregate(cursor)
+            total_rows.extend(next_result.rows)
+            pages += 1
+            cursor = next_result.cursor
+            final_cid = cursor.cid if cursor is not None else 0
+    finally:
+        if (
+            cursor is not None
+            and cursor.cid != 0
+            and pages >= max_pages
+        ):
+            try:
+                r.execute_command(
+                    "FT.CURSOR", "DEL", INDEX_NAME, cursor.cid
+                )
+            except redis.exceptions.ResponseError:
+                pass
+
+    return {
+        "pages": pages,
+        "cursor_id": final_cid,
+        "rows_total": len(total_rows),
+        "rows": total_rows,
+    }
+
+
+def q_cur_decade_format_matrix() -> Callable[[redis.Redis], object]:
+    """Per (decade, format) with QUANTILE/STDDEV/COUNT_DISTINCT; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@is_available:{True})")
+            .load("@year_published", "@format", "@price", "@pages")
+            .apply(decade="floor(@year_published/10)*10")
+            .apply(fmt_up="upper(@format)")
+            .group_by(
+                ["@decade", "@fmt_up"],
+                reducers.count().alias("books"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.quantile("@price", 0.5).alias("median_price"),
+                reducers.stddev("@pages").alias("stddev_pages"),
+                reducers.count_distinct("@publisher").alias("distinct_pubs"),
+                reducers.min("@global_sales").alias("min_sales"),
+                reducers.max("@global_sales").alias("max_sales"),
+            )
+            .sort_by(aggregations.Asc("@decade"), aggregations.Asc("@fmt_up"))
+            .cursor(count=PAGE_COUNT_DEFAULT, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req)
+
+    return run
+
+
+def q_cur_author_deep_stats() -> Callable[[redis.Redis], object]:
+    """Per-author deep stats: distinct genres/editions, score quantiles, year extremes; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@author", "@word_count", "@year_published")
+            .group_by(
+                ["@author"],
+                reducers.count().alias("books"),
+                reducers.count_distinct("@genres").alias("distinct_genres"),
+                reducers.count_distinctish("@editions")
+                        .alias("approx_editions"),
+                reducers.quantile("@score", 0.5).alias("median_score"),
+                reducers.quantile("@score", 0.9).alias("p90_score"),
+                reducers.stddev("@word_count").alias("wc_stddev"),
+                reducers.min("@year_published").alias("first_year"),
+                reducers.max("@year_published").alias("last_year"),
+                reducers.random_sample("@title", 3).alias("sample_titles"),
+            )
+            .filter("@books >= 2")
+            .sort_by(aggregations.Desc("@distinct_genres"))
+            .cursor(count=PAGE_COUNT_DEFAULT, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req)
+
+    return run
+
+
+def q_cur_publisher_market_share() -> Callable[[redis.Redis], object]:
+    """Per (decade, publisher): sales, books, distinct authors, top title; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@is_available:{True})")
+            .load("@publisher", "@author", "@global_sales", "@year_published")
+            .apply(decade="floor(@year_published/10)*10")
+            .group_by(
+                ["@decade", "@publisher"],
+                reducers.count().alias("books"),
+                reducers.sum("@global_sales").alias("pub_sales"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@global_sales")
+                ).alias("top_title"),
+            )
+            .filter("@books >= 1")
+            .sort_by(aggregations.Asc("@decade"),
+                     aggregations.Desc("@pub_sales"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
+def q_cur_price_band_profile() -> Callable[[redis.Redis], object]:
+    """Price-band profile: distinct formats/genres, avg score, p75 votes; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@price:[(0 +inf])")
+            .load("@price", "@title")
+            .apply(price_band="floor(@price/10)*10")
+            .group_by(
+                ["@price_band"],
+                reducers.count().alias("books"),
+                reducers.count_distinct("@format").alias("distinct_formats"),
+                reducers.count_distinct("@genres").alias("distinct_genres"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.quantile("@rating_votes", 0.75).alias("p75_votes"),
+                reducers.random_sample("@title", 3).alias("samples"),
+            )
+            .sort_by(aggregations.Asc("@price_band"))
+            .cursor(count=30, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=30)
+
+    return run
+
+
+def q_cur_rating_tier_stats() -> Callable[[redis.Redis], object]:
+    """Rating-votes tiers (floor/100*100): score, price, authors, year extremes; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@rating_votes", "@title")
+            .apply(vote_tier="floor(@rating_votes/100)*100")
+            .group_by(
+                ["@vote_tier"],
+                reducers.count().alias("books"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.quantile("@price", 0.5).alias("median_price"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.min("@year_published").alias("min_year"),
+                reducers.max("@year_published").alias("max_year"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@score")
+                ).alias("top_scored_title"),
+            )
+            .sort_by(aggregations.Asc("@vote_tier"))
+            .cursor(count=30, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=30)
+
+    return run
+
+
+def q_cur_score_buckets() -> Callable[[redis.Redis], object]:
+    """Score bucket floor: pages, sales, translations, formats, top voted; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@score", "@title", "@global_sales")
+            .apply(score_bucket="floor(@score)")
+            .group_by(
+                ["@score_bucket"],
+                reducers.count().alias("books"),
+                reducers.avg("@pages").alias("avg_pages"),
+                reducers.quantile("@global_sales", 0.9).alias("p90_sales"),
+                reducers.sum("@translations_count").alias("total_tx"),
+                reducers.count_distinct("@format").alias("distinct_formats"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@rating_votes")
+                ).alias("top_voted"),
+            )
+            .sort_by(aggregations.Asc("@score_bucket"))
+            .cursor(count=30, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=30)
+
+    return run
+
+
+def q_cur_reading_hours() -> Callable[[redis.Redis], object]:
+    """Reading-time hour buckets: word_count, pages, sales, authors, chars; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@reading_time_minutes:[(0 +inf])")
+            .load("@reading_time_minutes", "@word_count", "@title")
+            .apply(hours="floor(@reading_time_minutes/60)")
+            .group_by(
+                ["@hours"],
+                reducers.count().alias("books"),
+                reducers.avg("@word_count").alias("avg_wc"),
+                reducers.quantile("@pages", 0.5).alias("median_pages"),
+                reducers.quantile("@global_sales", 0.95).alias("p95_sales"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.random_sample("@main_character", 3)
+                        .alias("sample_chars"),
+            )
+            .sort_by(aggregations.Asc("@hours"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
+def q_cur_volume_density() -> Callable[[redis.Redis], object]:
+    """Density bands (weight/volume * 10 floored/10): pages, price, formats; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@weight_grams:[(0 +inf])")
+            .load("@width_cm", "@height_cm", "@depth_cm", "@weight_grams")
+            .apply(volume="@width_cm * @height_cm * @depth_cm")
+            .apply(density="@weight_grams / @volume")
+            .apply(density_band="floor(@density*10)/10")
+            .filter("@volume > 0 && @density > 0")
+            .group_by(
+                ["@density_band"],
+                reducers.count().alias("books"),
+                reducers.avg("@pages").alias("avg_pages"),
+                reducers.quantile("@price", 0.5).alias("median_price"),
+                reducers.count_distinct("@format").alias("distinct_formats"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@translations_count")
+                ).alias("most_translated"),
+            )
+            .sort_by(aggregations.Asc("@density_band"))
+            .cursor(count=30, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=30)
+
+    return run
+
+
+def q_cur_chapter_efficiency() -> Callable[[redis.Redis], object]:
+    """Log-bucket of words-per-chapter: score, price, genres, samples; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@chapter_count:[(0 +inf])")
+            .load("@word_count", "@chapter_count", "@title")
+            .apply(chap_density="@word_count / @chapter_count")
+            .apply(density_bucket="floor(log(@chap_density + 1))")
+            .filter("@chap_density > 0")
+            .group_by(
+                ["@density_bucket"],
+                reducers.count().alias("books"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.quantile("@price", 0.75).alias("p75_price"),
+                reducers.count_distinct("@genres").alias("distinct_genres"),
+                reducers.random_sample("@title", 3).alias("samples"),
+            )
+            .sort_by(aggregations.Asc("@density_bucket"))
+            .cursor(count=30, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=30)
+
+    return run
+
+
+def q_cur_citation_leaders() -> Callable[[redis.Redis], object]:
+    """Per-author citation leaders: citation/review ratio, distinct publishers; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@review_count:[(0 +inf])")
+            .load("@author", "@citation_count", "@review_count", "@title")
+            .apply(cite_ratio="@citation_count / @review_count")
+            .group_by(
+                ["@author"],
+                reducers.count().alias("books"),
+                reducers.avg("@cite_ratio").alias("avg_cite_ratio"),
+                reducers.quantile("@citation_count", 0.5).alias("median_cites"),
+                reducers.sum("@review_count").alias("total_reviews"),
+                reducers.count_distinct("@publisher").alias("distinct_pubs"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@citation_count")
+                ).alias("top_cited"),
+            )
+            .filter("@books >= 2")
+            .sort_by(aggregations.Desc("@avg_cite_ratio"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
+def q_cur_translation_reach() -> Callable[[redis.Redis], object]:
+    """Per (publisher, decade) translations: author age, sales, distinct chars; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@translations_count:[(0 +inf])")
+            .load("@publisher", "@translations_count",
+                  "@author_age_at_publication", "@year_published",
+                  "@global_sales")
+            .apply(decade="floor(@year_published/10)*10")
+            .group_by(
+                ["@publisher", "@decade"],
+                reducers.count().alias("books"),
+                reducers.sum("@translations_count").alias("total_tx"),
+                reducers.avg("@author_age_at_publication").alias("avg_age"),
+                reducers.quantile("@global_sales", 0.9).alias("p90_sales"),
+                reducers.count_distinct("@main_character")
+                        .alias("distinct_chars"),
+                reducers.random_sample("@genres", 3).alias("sample_genres"),
+            )
+            .filter("@books >= 1")
+            .sort_by(aggregations.Asc("@decade"),
+                     aggregations.Desc("@total_tx"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
+def q_cur_edition_number_stats() -> Callable[[redis.Redis], object]:
+    """Per edition_number: price, word_count, distinct authors, bestseller; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@edition_number", "@price", "@word_count")
+            .group_by(
+                ["@edition_number"],
+                reducers.count().alias("books"),
+                reducers.avg("@price").alias("avg_price"),
+                reducers.quantile("@word_count", 0.5).alias("median_wc"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@global_sales")
+                ).alias("bestseller"),
+                reducers.max("@global_sales").alias("top_sales"),
+            )
+            .sort_by(aggregations.Asc("@edition_number"))
+            .cursor(count=20, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=20)
+
+    return run
+
+
+def q_cur_author_age_bands() -> Callable[[redis.Redis], object]:
+    """Per (author_age_band, decade): score, votes, genres, top title; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@author_age_at_publication:[(0 +inf])")
+            .load("@author_age_at_publication", "@year_published")
+            .apply(age_band="floor(@author_age_at_publication/10)*10")
+            .apply(decade="floor(@year_published/10)*10")
+            .group_by(
+                ["@age_band", "@decade"],
+                reducers.count().alias("books"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.quantile("@rating_votes", 0.5).alias("median_votes"),
+                reducers.count_distinct("@genres").alias("distinct_genres"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@score")
+                ).alias("top_title"),
+            )
+            .sort_by(aggregations.Asc("@age_band"),
+                     aggregations.Asc("@decade"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
+def q_cur_format_availability() -> Callable[[redis.Redis], object]:
+    """Per (format, is_available): stddev price, distinct authors, sample publishers; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("*")
+            .load("@format", "@is_available", "@price", "@publisher")
+            .apply(fmt_up="upper(@format)")
+            .group_by(
+                ["@fmt_up", "@is_available"],
+                reducers.count().alias("books"),
+                reducers.avg("@pages").alias("avg_pages"),
+                reducers.quantile("@word_count", 0.5).alias("median_wc"),
+                reducers.stddev("@price").alias("stddev_price"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.random_sample("@publisher", 3).alias("sample_pubs"),
+            )
+            .sort_by(aggregations.Asc("@fmt_up"))
+            .cursor(count=20, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=20)
+
+    return run
+
+
+def q_cur_timestamp_monthly() -> Callable[[redis.Redis], object]:
+    """Monthly time series via timefmt: sales, votes, authors, samples; cursor-drained."""
+
+    def run(r: redis.Redis):
+        req = (
+            AggregateRequest("(@timestamp:[(0 +inf])")
+            .load("@timestamp", "@title", "@global_sales")
+            .apply(ym="timefmt(@timestamp,\"%Y-%m\")")
+            .group_by(
+                ["@ym"],
+                reducers.count().alias("books"),
+                reducers.avg("@global_sales").alias("avg_sales"),
+                reducers.quantile("@rating_votes", 0.9).alias("p90_votes"),
+                reducers.count_distinct("@author").alias("distinct_authors"),
+                reducers.random_sample("@title", 3).alias("samples"),
+            )
+            .sort_by(aggregations.Asc("@ym"))
+            .cursor(count=40, max_idle=MAX_IDLE_DEFAULT)
+            .dialect(2)
+        )
+        return _drain_cursor(r.ft(INDEX_NAME), r, req, page_count=40)
+
+    return run
+
+
 # The full pool of query factories the generator will cycle through.
 ALL_QUERIES: List[Callable[[], Callable[[redis.Redis], object]]] = [
     q_faceted_fuzzy_search,
@@ -657,6 +1141,21 @@ ALL_QUERIES: List[Callable[[], Callable[[redis.Redis], object]]] = [
     q_agg_price_per_page_leaders,
     q_agg_inventory_status_funnel,
     q_agg_cursor_catalog_dashboard,
+    q_cur_decade_format_matrix,
+    q_cur_author_deep_stats,
+    q_cur_publisher_market_share,
+    q_cur_price_band_profile,
+    q_cur_rating_tier_stats,
+    q_cur_score_buckets,
+    q_cur_reading_hours,
+    q_cur_volume_density,
+    q_cur_chapter_efficiency,
+    q_cur_citation_leaders,
+    q_cur_translation_reach,
+    q_cur_edition_number_stats,
+    q_cur_author_age_bands,
+    q_cur_format_availability,
+    q_cur_timestamp_monthly,
 ]
 
 
