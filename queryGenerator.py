@@ -461,6 +461,149 @@ def q_agg_price_per_page_leaders() -> Callable[[redis.Redis], object]:
     return run
 
 
+def q_agg_cursor_catalog_dashboard() -> Callable[[redis.Redis], object]:
+    """Very complex WITHCURSOR aggregate, drained end-to-end.
+
+    Builds a multi-stage FT.AGGREGATE (many APPLYs, fine-grained GROUPBY,
+    double-filter, multi-key SORTBY) that produces enough rows for the
+    cursor to actually page. Then drains the cursor via FT.CURSOR READ
+    until it is exhausted or a hard page cap fires; on early exit it
+    explicitly runs FT.CURSOR DEL so no cursor is leaked on the server.
+
+    Returns a dict:
+        {"pages": <cursor pages consumed>,
+         "cursor_id": <0 on full drain, else the id that was DEL'd>,
+         "rows": <all rows merged across pages>}
+    """
+
+    PAGE_COUNT = 50          # rows per cursor page (FT.CURSOR READ COUNT)
+    MAX_IDLE_SEC = 5          # server-side idle TTL before reaping (seconds)
+    MAX_PAGES = 40           # hard cap so one call can't monopolize a worker
+
+    def run(r: redis.Redis):
+        lo_year = random.randint(1900, 1990)
+        hi_year = min(lo_year + random.randint(10, 60), 2023)
+        min_votes = random.choice([10, 50, 100, 200])
+        max_delay = random.choice([200, 500, 1000])
+
+        req = (
+            AggregateRequest(
+                f"(@is_available:{{True}}) "
+                f"(@year_published:[{lo_year} {hi_year}]) "
+                f"(@rating_votes:[{min_votes} +inf]) "
+                f"(@pages:[(0 +inf]) "
+                f"(@weight_grams:[(0 +inf]) "
+                f"(@publishing_delay:[-inf {max_delay}])"
+            )
+            .load(
+                "@author", "@title", "@publisher", "@main_character",
+                "@year_published", "@score", "@rating_votes",
+                "@pages", "@price", "@global_sales", "@word_count",
+                "@chapter_count", "@weight_grams",
+                "@width_cm", "@height_cm", "@depth_cm",
+                "@translations_count", "@format",
+            )
+            .apply(decade="floor(@year_published/10)*10")
+            .apply(price_per_page="@price / @pages")
+            .apply(
+                value_score="(@score * log(@rating_votes + 1)) "
+                            "/ (@price_per_page + 0.01)"
+            )
+            .apply(text_density="@word_count / @chapter_count")
+            .apply(volume_cm3="@width_cm * @height_cm * @depth_cm")
+            .apply(density_g_cm3="@weight_grams / @volume_cm3")
+            .apply(fmt_up="upper(@format)")
+            .filter("@volume_cm3 > 0 && @price_per_page > 0")
+            # Fine-grained bucket so the cursor has pages to drain.
+            .group_by(
+                ["@author", "@decade", "@fmt_up"],
+                reducers.count().alias("books"),
+                reducers.sum("@global_sales").alias("bucket_sales"),
+                reducers.avg("@score").alias("avg_score"),
+                reducers.avg("@translations_count").alias("avg_tx"),
+                reducers.quantile("@value_score", 0.5)
+                        .alias("median_value_score"),
+                reducers.quantile("@value_score", 0.9)
+                        .alias("p90_value_score"),
+                reducers.stddev("@text_density").alias("stddev_density"),
+                reducers.max("@global_sales").alias("top_sales"),
+                reducers.min("@price").alias("min_price"),
+                reducers.count_distinct("@publisher")
+                        .alias("distinct_publishers"),
+                reducers.first_value(
+                    "@title", aggregations.Desc("@value_score")
+                ).alias("top_value_title"),
+                reducers.first_value(
+                    "@publisher", aggregations.Desc("@global_sales")
+                ).alias("top_publisher"),
+                reducers.random_sample("@main_character", 2)
+                        .alias("sample_chars"),
+                reducers.tolist("@publisher").alias("publishers"),
+            )
+            .apply(sales_per_book="@bucket_sales / @books")
+            .apply(
+                bucket_summary="format("
+                               "\"%s/%d/%s: %d books, top=%s, $%.2f/book\", "
+                               "@author, @decade, @fmt_up, @books, "
+                               "@top_value_title, @sales_per_book)"
+            )
+            .filter("@books >= 1 && @median_value_score > 0")
+            .sort_by(
+                aggregations.Asc("@decade"),
+                aggregations.Desc("@bucket_sales"),
+                aggregations.Desc("@p90_value_score"),
+            )
+            .cursor(count=PAGE_COUNT, max_idle=MAX_IDLE_SEC)
+            .dialect(2)
+        )
+
+        pages = 0
+        total_rows: List = []
+        ft = r.ft(INDEX_NAME)
+
+        result = ft.aggregate(req)
+        total_rows.extend(result.rows)
+        pages += 1
+        cursor = result.cursor
+        final_cid = cursor.cid if cursor is not None else 0
+
+        try:
+            while (
+                cursor is not None
+                and cursor.cid != 0
+                and pages < MAX_PAGES
+            ):
+                cursor.count = PAGE_COUNT
+                next_result = ft.aggregate(cursor)
+                total_rows.extend(next_result.rows)
+                pages += 1
+                cursor = next_result.cursor
+                final_cid = cursor.cid if cursor is not None else 0
+        finally:
+            # If we stopped early (page cap / exception), release the
+            # cursor so it doesn't sit on the server until MAXIDLE.
+            if (
+                cursor is not None
+                and cursor.cid != 0
+                and pages >= MAX_PAGES
+            ):
+                try:
+                    r.execute_command(
+                        "FT.CURSOR", "DEL", INDEX_NAME, cursor.cid
+                    )
+                except redis.exceptions.ResponseError:
+                    pass
+
+        return {
+            "pages": pages,
+            "cursor_id": final_cid,
+            "rows_total": len(total_rows),
+            "rows": total_rows,
+        }
+
+    return run
+
+
 def q_agg_inventory_status_funnel() -> Callable[[redis.Redis], object]:
     """Inventory funnel per format: counts per status with string formatting."""
 
@@ -509,6 +652,7 @@ ALL_QUERIES: List[Callable[[], Callable[[redis.Redis], object]]] = [
     q_agg_author_distinct_genres,
     q_agg_price_per_page_leaders,
     q_agg_inventory_status_funnel,
+    q_agg_cursor_catalog_dashboard,
 ]
 
 
@@ -761,6 +905,16 @@ def _print_test_result(name: str, doc_help: Optional[str],
     if result is None:
         print("(no result)")
         return
+
+    # Some queries (e.g. the cursor-driven aggregate) return a dict that
+    # carries both metadata and the actual rows. Unwrap it so the rest of
+    # the printer can treat it uniformly.
+    if isinstance(result, dict) and "rows" in result and isinstance(
+        result.get("rows"), list
+    ):
+        for k in sorted(k for k in result if k != "rows"):
+            print(f"{k:<14s} = {_fmt_value(result[k])}")
+        result = result["rows"]
 
     # ``result`` is either a list of Document objects (FT.SEARCH .docs) or
     # a list of aggregate rows (list/dict/tuple).
