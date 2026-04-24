@@ -9,10 +9,14 @@ from faker import Faker
 import redis.commands.search.aggregation as aggregations
 import redis.commands.search.reducers as reducers
 from redis.commands.json.path import Path  
-from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 from redis.commands.search.field import TextField, TagField, NumericField
 from redis.commands.search.query import NumericFilter, Query
 from redis.commands.search.aggregation import AggregateRequest
+
+try:
+    from redis.commands.search.index_definition import IndexDefinition, IndexType
+except ImportError:
+    from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 
 
 # TO LIST

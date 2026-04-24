@@ -27,9 +27,15 @@ apt install -y python3-pip
 pip3 install redis faker
 ```
 
+Recent `redis-py` releases expose RediSearch index definitions from
+`redis.commands.search.index_definition`. The scripts in this repository now
+handle both the modern module path and the older
+`redis.commands.search.indexDefinition` path for compatibility across Ubuntu
+VMs with different `redis` package versions.
+
 ## Usage
 ```bash
-python3 redis_bookstore_tester.py [options]
+python3 bookSearch.py [options]
 ```
 
 ### Command Line Options
@@ -57,7 +63,13 @@ python3 redis_bookstore_tester.py [options]
 
 ## Example
 ```bash
-python3 redis_bookstore_tester.py --redis redis://redis-server:6379 --max-connections 20 --max-books 5000 --run-random-cmds
+python3 bookSearch.py --redis redis://redis-server:6379 --max-connections 20 --max-books 5000 --run-random-cmds
+```
+
+For the query stress tool, use:
+
+```bash
+python3 bookQuery.py --redis-url redis://redis-server:6379
 ```
 
 ## Notes
