@@ -1,0 +1,350 @@
+# ============================================================================
+#  queryGenerator.py -- manual redis-cli debug script
+#  Target: redis-10000.aws-alon-7300.env0.qa.redislabs.com:10000
+#  Index:  idx:books
+#  This file lists every query the generator issues, with each FT.SEARCH or
+#  FT.AGGREGATE written as a ready-to-paste `redis-cli` invocation.
+#
+#  Layout
+#  ------
+#    0. Sanity probes (PING, FT._LIST, FT.INFO, doc count)
+#    1. FT.SEARCH queries                        (7)
+#    2. FT.AGGREGATE queries (no cursor)         (7)
+#    3. FT.AGGREGATE queries WITH WITHCURSOR     (16)
+#       - each followed by a template FT.CURSOR READ / FT.CURSOR DEL line
+#    4. Known-problem queries isolated at the bottom:
+#       - @geo:[...] queries that repeatedly close the connection and
+#         trigger a multi-minute LOADING window on this cluster.
+#       - Queries using format() with non-%s specifiers that return
+#         SEARCH_PARSE_ARGS on this cluster.
+#    4c. Intersection-heavy FT.SEARCH queries (10)    -- live-tested,
+#        each query is an AND of 11-20 predicates across tags / text /
+#        numerics; all return >= 1 hit on the seeded idx:books.
+#    5. Extra diagnostic commands (EXPLAIN / PROFILE / TAGVALS / CONFIG /
+#       LOADING watch loop).
+#
+#  To run an individual query, copy its `redis-cli ...` line (a single line
+#  in this file -- long lines intentionally not wrapped) and paste it into
+#  your shell. Quoting is shell-safe.
+# ============================================================================
+
+# ---- 0. Sanity probes ------------------------------------------------------
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 PING
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT._LIST
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.INFO idx:books | head -40
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '*' LIMIT 0 0
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 DBSIZE
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 INFO server | head -20
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 INFO keyspace
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 MODULE LIST
+
+
+# ---- 1. FT.SEARCH queries ------------------------------------------------------
+
+# ------- q_faceted_fuzzy_search -------
+# Highly-rated fantasy/sci-fi with fuzzy+phrase text matching.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '((@title|description:(%experience% | "ancient kingdom"=>{$slop:2; $inorder:true})) => {$weight:2.0}) (@genres:{fantasy|science\ fiction}) (@format:{hardcover|ebook}) (@is_available:{True}) (@year_published:[(1990 +inf]) (@score:[4 +inf]) (@price:[-inf (50]) -@author:"Alon Shmuely"' FILTER rating_votes 200 +inf SCORER BM25 WITHSCORES RETURN 9 title author price year_published genres description score AS book_score SORTBY score DESC DIALECT 2 SUMMARIZE FIELDS 1 description LEN 15 FRAGS 2 SEPARATOR ' ... ' HIGHLIGHT FIELDS 2 title description TAGS '<b>' '</b>' LIMIT 0 25
+
+# ------- q_optional_boost_search -------
+# Optional clauses that only boost ranking.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@format:{paperback}) (@is_available:{True}) (@price:[-inf 30]) ~(@description:love | @main_character:Emma) ~@year_published:[2015 +inf]' SCORER TFIDF.DOCNORM WITHSCORES RETURN 4 title main_character year_published price DIALECT 2 LIMIT 0 50
+
+# ------- q_parameterized_price_window -------
+# Parameterized FT.SEARCH with $params binding and DIALECT 2.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@year_published:[$lo $hi]) (@score:[$min_score +inf]) (@price:[-inf ($max_price]) (@is_available:{True})' RETURN 5 title author year_published score price SORTBY year_published ASC DIALECT 2 LIMIT 0 50 PARAMS 8 lo 1914 hi 1919 min_score 2.68 max_price 100
+
+# ------- q_prefix_suffix_infix_text -------
+# Prefix / suffix / infix wildcard TEXT matching with VERBATIM.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@title:rby*) (@description:*ye*) (@author:*op) (@is_available:{True})' VERBATIM RETURN 3 title author description DIALECT 2 LIMIT 0 20
+
+# ------- q_negative_heavy_search -------
+# Negation-heavy query: exclude genres, statuses, formats, keywords.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) -(@genres:{horror|true\ crime}) -(@status:{maintenance|on_loan}) -(@format:{ebook}) -(@description:(violence|gore)) -@author:"Alon Shmuely" (@rating_votes:[50 +inf]) (@score:[3 +inf])' RETURN 6 title author genres format score rating_votes SORTBY rating_votes DESC DIALECT 2 LIMIT 0 40
+
+
+# ---- 2. FT.AGGREGATE queries (no WITHCURSOR) -----------------------------------
+
+# ------- q_agg_author_productivity -------
+# Per-author productivity with QUANTILE / STDDEV reducers.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF LOAD 1 @author DIALECT 2 APPLY '@global_sales / @pages' AS sales_per_page GROUPBY 1 @author REDUCE COUNT 0 AS book_count REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @price 0.5 AS median_price REDUCE QUANTILE 2 @global_sales 0.95 AS p95_sales REDUCE STDDEV 1 @word_count AS wc_stddev REDUCE AVG 1 @sales_per_page AS avg_sales_per_page FILTER '@book_count >= 3 && @avg_score >= 3.5' SORTBY 2 @p95_sales DESC LIMIT 0 100
+
+# ------- q_agg_publisher_leaderboard -------
+# Two-stage GROUPBY with top-publisher share per decade.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True})' SCORER TFIDF LOAD 3 @publisher @global_sales @year_published DIALECT 2 APPLY 'floor(@year_published/10)*10' AS decade GROUPBY 2 @decade @publisher REDUCE SUM 1 @global_sales AS pub_sales REDUCE COUNT 0 AS pub_books GROUPBY 1 @decade REDUCE SUM 1 @pub_sales AS decade_sales REDUCE FIRST_VALUE 4 @publisher BY @pub_sales DESC AS top_publisher REDUCE MAX 1 @pub_sales AS top_publisher_sales APPLY '@top_publisher_sales / @decade_sales' AS top_share FILTER '@top_share > 0.01' SORTBY 2 @decade ASC
+
+# ------- q_agg_reading_efficiency -------
+# Reading-efficiency buckets with QUANTILE + RANDOM_SAMPLE.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@reading_time_minutes:[(0 +inf]) (@publishing_delay:[0 +inf])' SCORER TFIDF LOAD 5 @title @pages @chapter_count @price @word_count DIALECT 2 APPLY '@word_count / @reading_time_minutes' AS wpm APPLY 'floor( log(@wpm + 1) )' AS wpm_bucket GROUPBY 1 @wpm_bucket REDUCE COUNT 0 AS books REDUCE AVG 1 @pages AS avg_pages REDUCE AVG 1 @chapter_count AS avg_chapters REDUCE QUANTILE 2 @price 0.5 AS median_price REDUCE QUANTILE 2 @wpm 0.9 AS p90_wpm REDUCE RANDOM_SAMPLE 2 @title 5 AS sample_titles SORTBY 2 @wpm_bucket ASC
+
+# ------- q_agg_author_distinct_genres -------
+# Author versatility: distinct genres/editions + date-formatted activity.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True})' SCORER TFIDF LOAD 2 @author @timestamp DIALECT 2 APPLY 'timefmt(@timestamp, "%Y-%m")' AS last_active GROUPBY 1 @author REDUCE COUNT 0 AS books REDUCE COUNT_DISTINCT 1 @genres AS distinct_genres REDUCE COUNT_DISTINCTISH 1 @editions AS distinct_editions_approx REDUCE MAX 1 @timestamp AS last_ts REDUCE TOLIST 1 @last_active AS active_months REDUCE AVG 1 @score AS avg_score APPLY 'timefmt(@last_ts, "%Y-%m-%d")' AS last_active_str FILTER '@books >= 2 && @distinct_genres >= 2' SORTBY 4 @distinct_genres DESC @books DESC LIMIT 0 50
+
+# ------- q_agg_price_per_page_leaders -------
+# Value-for-money leaderboard: price/page, citation/review, size vs weight.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True}) (@pages:[(0 +inf]) (@review_count:[(0 +inf])' SCORER TFIDF LOAD 10 @title @author @price @pages @citation_count @review_count @weight_grams @width_cm @height_cm @depth_cm DIALECT 2 APPLY '@price / @pages' AS price_per_page APPLY '@citation_count / @review_count' AS citation_ratio APPLY '@width_cm * @height_cm * @depth_cm' AS volume_cm3 APPLY '@weight_grams / @volume_cm3' AS density_g_cm3 FILTER '@price_per_page > 0 && @volume_cm3 > 0' GROUPBY 1 @author REDUCE COUNT 0 AS books REDUCE AVG 1 @price_per_page AS avg_ppp REDUCE QUANTILE 2 @price_per_page 0.5 AS median_ppp REDUCE AVG 1 @citation_ratio AS avg_citation_ratio REDUCE AVG 1 @density_g_cm3 AS avg_density REDUCE FIRST_VALUE 4 @title BY @price_per_page ASC AS cheapest_title FILTER '@books >= 2' SORTBY 2 @median_ppp ASC LIMIT 0 25
+
+
+# ---- 3. FT.AGGREGATE queries with WITHCURSOR -----------------------------------
+
+# ------- q_cur_decade_format_matrix -------
+# Per (decade, format) with QUANTILE/STDDEV/COUNT_DISTINCT; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True})' SCORER TFIDF WITHCURSOR COUNT 50 MAXIDLE 10000 LOAD 4 @year_published @format @price @pages DIALECT 2 APPLY 'floor(@year_published/10)*10' AS decade APPLY 'upper(@format)' AS fmt_up GROUPBY 2 @decade @fmt_up REDUCE COUNT 0 AS books REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @price 0.5 AS median_price REDUCE STDDEV 1 @pages AS stddev_pages REDUCE COUNT_DISTINCT 1 @publisher AS distinct_pubs REDUCE MIN 1 @global_sales AS min_sales REDUCE MAX 1 @global_sales AS max_sales SORTBY 4 @decade ASC @fmt_up ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_author_deep_stats -------
+# Per-author deep stats: distinct genres/editions, score quantiles, year extremes; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF WITHCURSOR COUNT 50 MAXIDLE 10000 LOAD 3 @author @word_count @year_published DIALECT 2 GROUPBY 1 @author REDUCE COUNT 0 AS books REDUCE COUNT_DISTINCT 1 @genres AS distinct_genres REDUCE COUNT_DISTINCTISH 1 @editions AS approx_editions REDUCE QUANTILE 2 @score 0.5 AS median_score REDUCE QUANTILE 2 @score 0.9 AS p90_score REDUCE STDDEV 1 @word_count AS wc_stddev REDUCE MIN 1 @year_published AS first_year REDUCE MAX 1 @year_published AS last_year REDUCE RANDOM_SAMPLE 2 @title 3 AS sample_titles FILTER '@books >= 2' SORTBY 2 @distinct_genres DESC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_publisher_market_share -------
+# Per (decade, publisher): sales, books, distinct authors, top title; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True})' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 4 @publisher @author @global_sales @year_published DIALECT 2 APPLY 'floor(@year_published/10)*10' AS decade GROUPBY 2 @decade @publisher REDUCE COUNT 0 AS books REDUCE SUM 1 @global_sales AS pub_sales REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE FIRST_VALUE 4 @title BY @global_sales DESC AS top_title FILTER '@books >= 1' SORTBY 4 @decade ASC @pub_sales DESC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_price_band_profile -------
+# Price-band profile: distinct formats/genres, avg score, p75 votes; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@price:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 30 MAXIDLE 10000 LOAD 2 @price @title DIALECT 2 APPLY 'floor(@price/10)*10' AS price_band GROUPBY 1 @price_band REDUCE COUNT 0 AS books REDUCE COUNT_DISTINCT 1 @format AS distinct_formats REDUCE COUNT_DISTINCT 1 @genres AS distinct_genres REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @rating_votes 0.75 AS p75_votes REDUCE RANDOM_SAMPLE 2 @title 3 AS samples SORTBY 2 @price_band ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_rating_tier_stats -------
+# Rating-votes tiers (floor/100*100): score, price, authors, year extremes; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF WITHCURSOR COUNT 30 MAXIDLE 10000 LOAD 2 @rating_votes @title DIALECT 2 APPLY 'floor(@rating_votes/100)*100' AS vote_tier GROUPBY 1 @vote_tier REDUCE COUNT 0 AS books REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @price 0.5 AS median_price REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE MIN 1 @year_published AS min_year REDUCE MAX 1 @year_published AS max_year REDUCE FIRST_VALUE 4 @title BY @score DESC AS top_scored_title SORTBY 2 @vote_tier ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_score_buckets -------
+# Score bucket floor: pages, sales, translations, formats, top voted; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF WITHCURSOR COUNT 30 MAXIDLE 10000 LOAD 3 @score @title @global_sales DIALECT 2 APPLY 'floor(@score)' AS score_bucket GROUPBY 1 @score_bucket REDUCE COUNT 0 AS books REDUCE AVG 1 @pages AS avg_pages REDUCE QUANTILE 2 @global_sales 0.9 AS p90_sales REDUCE SUM 1 @translations_count AS total_tx REDUCE COUNT_DISTINCT 1 @format AS distinct_formats REDUCE FIRST_VALUE 4 @title BY @rating_votes DESC AS top_voted SORTBY 2 @score_bucket ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_reading_hours -------
+# Reading-time hour buckets: word_count, pages, sales, authors, chars; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@reading_time_minutes:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 3 @reading_time_minutes @word_count @title DIALECT 2 APPLY 'floor(@reading_time_minutes/60)' AS hours GROUPBY 1 @hours REDUCE COUNT 0 AS books REDUCE AVG 1 @word_count AS avg_wc REDUCE QUANTILE 2 @pages 0.5 AS median_pages REDUCE QUANTILE 2 @global_sales 0.95 AS p95_sales REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE RANDOM_SAMPLE 2 @main_character 3 AS sample_chars SORTBY 2 @hours ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_volume_density -------
+# Density bands (weight/volume * 10 floored/10): pages, price, formats; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@weight_grams:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 30 MAXIDLE 10000 LOAD 4 @width_cm @height_cm @depth_cm @weight_grams DIALECT 2 APPLY '@width_cm * @height_cm * @depth_cm' AS volume APPLY '@weight_grams / @volume' AS density APPLY 'floor(@density*10)/10' AS density_band FILTER '@volume > 0 && @density > 0' GROUPBY 1 @density_band REDUCE COUNT 0 AS books REDUCE AVG 1 @pages AS avg_pages REDUCE QUANTILE 2 @price 0.5 AS median_price REDUCE COUNT_DISTINCT 1 @format AS distinct_formats REDUCE FIRST_VALUE 4 @title BY @translations_count DESC AS most_translated SORTBY 2 @density_band ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_chapter_efficiency -------
+# Log-bucket of words-per-chapter: score, price, genres, samples; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@chapter_count:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 30 MAXIDLE 10000 LOAD 3 @word_count @chapter_count @title DIALECT 2 APPLY '@word_count / @chapter_count' AS chap_density APPLY 'floor(log(@chap_density + 1))' AS density_bucket FILTER '@chap_density > 0' GROUPBY 1 @density_bucket REDUCE COUNT 0 AS books REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @price 0.75 AS p75_price REDUCE COUNT_DISTINCT 1 @genres AS distinct_genres REDUCE RANDOM_SAMPLE 2 @title 3 AS samples SORTBY 2 @density_bucket ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_citation_leaders -------
+# Per-author citation leaders: citation/review ratio, distinct publishers; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@review_count:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 4 @author @citation_count @review_count @title DIALECT 2 APPLY '@citation_count / @review_count' AS cite_ratio GROUPBY 1 @author REDUCE COUNT 0 AS books REDUCE AVG 1 @cite_ratio AS avg_cite_ratio REDUCE QUANTILE 2 @citation_count 0.5 AS median_cites REDUCE SUM 1 @review_count AS total_reviews REDUCE COUNT_DISTINCT 1 @publisher AS distinct_pubs REDUCE FIRST_VALUE 4 @title BY @citation_count DESC AS top_cited FILTER '@books >= 2' SORTBY 2 @avg_cite_ratio DESC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_translation_reach -------
+# Per (publisher, decade) translations: author age, sales, distinct chars; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@translations_count:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 5 @publisher @translations_count @author_age_at_publication @year_published @global_sales DIALECT 2 APPLY 'floor(@year_published/10)*10' AS decade GROUPBY 2 @publisher @decade REDUCE COUNT 0 AS books REDUCE SUM 1 @translations_count AS total_tx REDUCE AVG 1 @author_age_at_publication AS avg_age REDUCE QUANTILE 2 @global_sales 0.9 AS p90_sales REDUCE COUNT_DISTINCT 1 @main_character AS distinct_chars REDUCE RANDOM_SAMPLE 2 @genres 3 AS sample_genres FILTER '@books >= 1' SORTBY 4 @decade ASC @total_tx DESC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_edition_number_stats -------
+# Per edition_number: price, word_count, distinct authors, bestseller; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF WITHCURSOR COUNT 20 MAXIDLE 10000 LOAD 3 @edition_number @price @word_count DIALECT 2 GROUPBY 1 @edition_number REDUCE COUNT 0 AS books REDUCE AVG 1 @price AS avg_price REDUCE QUANTILE 2 @word_count 0.5 AS median_wc REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE FIRST_VALUE 4 @title BY @global_sales DESC AS bestseller REDUCE MAX 1 @global_sales AS top_sales SORTBY 2 @edition_number ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_author_age_bands -------
+# Per (author_age_band, decade): score, votes, genres, top title; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@author_age_at_publication:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 2 @author_age_at_publication @year_published DIALECT 2 APPLY 'floor(@author_age_at_publication/10)*10' AS age_band APPLY 'floor(@year_published/10)*10' AS decade GROUPBY 2 @age_band @decade REDUCE COUNT 0 AS books REDUCE AVG 1 @score AS avg_score REDUCE QUANTILE 2 @rating_votes 0.5 AS median_votes REDUCE COUNT_DISTINCT 1 @genres AS distinct_genres REDUCE FIRST_VALUE 4 @title BY @score DESC AS top_title SORTBY 4 @age_band ASC @decade ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_format_availability -------
+# Per (format, is_available): stddev price, distinct authors, sample publishers; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF WITHCURSOR COUNT 20 MAXIDLE 10000 LOAD 4 @format @is_available @price @publisher DIALECT 2 APPLY 'upper(@format)' AS fmt_up GROUPBY 2 @fmt_up @is_available REDUCE COUNT 0 AS books REDUCE AVG 1 @pages AS avg_pages REDUCE QUANTILE 2 @word_count 0.5 AS median_wc REDUCE STDDEV 1 @price AS stddev_price REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE RANDOM_SAMPLE 2 @publisher 3 AS sample_pubs SORTBY 2 @fmt_up ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ------- q_cur_timestamp_monthly -------
+# Monthly time series via timefmt: sales, votes, authors, samples; cursor-drained.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@timestamp:[(0 +inf])' SCORER TFIDF WITHCURSOR COUNT 40 MAXIDLE 10000 LOAD 3 @timestamp @title @global_sales DIALECT 2 APPLY 'timefmt(@timestamp,"%Y-%m")' AS ym GROUPBY 1 @ym REDUCE COUNT 0 AS books REDUCE AVG 1 @global_sales AS avg_sales REDUCE QUANTILE 2 @rating_votes 0.9 AS p90_votes REDUCE COUNT_DISTINCT 1 @author AS distinct_authors REDUCE RANDOM_SAMPLE 2 @title 3 AS samples SORTBY 2 @ym ASC
+# after the above, replace <CURSOR_ID> with the id printed at the
+# bottom of the reply, and drain / delete the cursor:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR READ idx:books <CURSOR_ID> COUNT 50
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CURSOR DEL  idx:books <CURSOR_ID>
+
+# ============================================================================
+#  4. Known-problem queries -- run with caution
+# ============================================================================
+# On the test cluster (redis-10000.aws-alon-7300.env0.qa.redislabs.com:10000)
+# each of the following reproducibly triggers a server-side problem.  They
+# are kept here so you can reproduce / investigate on demand, not for regular
+# load testing.
+#
+#   (a) @geo:[lon lat radius unit] queries                  -> connection
+#       closed by server, cluster enters LOADING for ~3 min,
+#       index is dropped and recreated by the seeder.
+#
+#   (b) format(...) with non-%s specifiers (%d, %.2f, etc.) -> server
+#       returns: SEARCH_PARSE_ARGS Unknown format specifier passed.
+#
+# After running any (a) query, expect subsequent queries to fail with
+#   'LOADING Redis is loading the dataset in memory'
+# for several minutes.
+# ============================================================================
+
+
+# ---- 4a. @geo:[...] queries (close the connection) -----------------------------
+
+# ------- q_multi_tag_geo_search -------
+# Multi-tag intersection + geo + multi-field sort.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@genres:{mystery}) (@genres:{thriller}) (@editions:{english}) (@editions:{french}) (@status:{for_sale}) (@word_count:[80000 150000]) (@chapter_count:[15 40]) (@weight_grams:[(0 +inf]) (@geo:[-0.1276 51.5074 500 km])' RETURN 5 title author score year_published format SORTBY score DESC DIALECT 2 LIMIT 0 30
+
+# ------- q_geo_radius_sorted -------
+# Simple geo-radius query, sorted by distance surrogate.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@geo:[139.6917 35.6895 1500 km])' RETURN 4 title author price score SORTBY score DESC DIALECT 2 LIMIT 0 100
+
+
+# ---- 4b. format() with non-%s specifiers (SEARCH_PARSE_ARGS) -------------------
+
+# ------- q_agg_geo_distance_buckets -------
+# Geo-distance bucketed aggregate with TOLIST / FIRST_VALUE.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@genres:{fantasy}) (@year_published:[2000 +inf])' SCORER TFIDF LOAD 4 @title @format @global_sales @geo DIALECT 2 APPLY 'geodistance(@geo, -73.9857, 40.7484)' AS dist_m APPLY 'floor(@dist_m/100000)*100' AS dist_bucket_km APPLY 'upper(@format)' AS fmt GROUPBY 2 @dist_bucket_km @fmt REDUCE COUNT 0 AS books REDUCE TOLIST 1 @title AS sample_titles REDUCE FIRST_VALUE 4 @title BY @global_sales DESC AS bestseller REDUCE MAX 1 @global_sales AS top_sales APPLY 'format("%s (%d sold)", @bestseller, @top_sales)' AS headline SORTBY 4 @dist_bucket_km ASC @books DESC LIMIT 0 40
+
+# ------- q_agg_inventory_status_funnel -------
+# Inventory funnel per format: counts per status with string formatting.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '*' SCORER TFIDF LOAD 4 @format @status @price @title DIALECT 2 APPLY 'upper(@format)' AS fmt_up APPLY 'lower(@status)' AS status_lc GROUPBY 2 @fmt_up @status_lc REDUCE COUNT 0 AS count REDUCE AVG 1 @price AS avg_price REDUCE MIN 1 @price AS min_price REDUCE MAX 1 @price AS max_price REDUCE RANDOM_SAMPLE 2 @title 3 AS samples APPLY 'format("%s/%s: %d books, avg $%.2f", @fmt_up, @status_lc, @count, @avg_price)' AS summary SORTBY 4 @fmt_up ASC @count DESC LIMIT 0 40
+
+# ------- q_agg_cursor_catalog_dashboard -------
+# Very complex WITHCURSOR aggregate, drained end-to-end.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.AGGREGATE idx:books '(@is_available:{True}) (@year_published:[1904 1956]) (@rating_votes:[10 +inf]) (@pages:[(0 +inf]) (@weight_grams:[(0 +inf]) (@publishing_delay:[-inf 200])' SCORER TFIDF WITHCURSOR COUNT 50 MAXIDLE 5000 LOAD 18 @author @title @publisher @main_character @year_published @score @rating_votes @pages @price @global_sales @word_count @chapter_count @weight_grams @width_cm @height_cm @depth_cm @translations_count @format DIALECT 2 APPLY 'floor(@year_published/10)*10' AS decade APPLY '@price / @pages' AS price_per_page APPLY '(@score * log(@rating_votes + 1)) / (@price_per_page + 0.01)' AS value_score APPLY '@word_count / @chapter_count' AS text_density APPLY '@width_cm * @height_cm * @depth_cm' AS volume_cm3 APPLY '@weight_grams / @volume_cm3' AS density_g_cm3 APPLY 'upper(@format)' AS fmt_up FILTER '@volume_cm3 > 0 && @price_per_page > 0' GROUPBY 3 @author @decade @fmt_up REDUCE COUNT 0 AS books REDUCE SUM 1 @global_sales AS bucket_sales REDUCE AVG 1 @score AS avg_score REDUCE AVG 1 @translations_count AS avg_tx REDUCE QUANTILE 2 @value_score 0.5 AS median_value_score REDUCE QUANTILE 2 @value_score 0.9 AS p90_value_score REDUCE STDDEV 1 @text_density AS stddev_density REDUCE MAX 1 @global_sales AS top_sales REDUCE MIN 1 @price AS min_price REDUCE COUNT_DISTINCT 1 @publisher AS distinct_publishers REDUCE FIRST_VALUE 4 @title BY @value_score DESC AS top_value_title REDUCE FIRST_VALUE 4 @publisher BY @global_sales DESC AS top_publisher REDUCE RANDOM_SAMPLE 2 @main_character 2 AS sample_chars REDUCE TOLIST 1 @publisher AS publishers APPLY '@bucket_sales / @books' AS sales_per_book APPLY 'format("%s/%d/%s: %d books, top=%s, $%.2f/book", @author, @decade, @fmt_up, @books, @top_value_title, @sales_per_book)' AS bucket_summary FILTER '@books >= 1 && @median_value_score > 0' SORTBY 6 @decade ASC @bucket_sales DESC @p90_value_score DESC
+
+# ============================================================================
+#  4c. Intersection-heavy FT.SEARCH queries (live-tested, every one returns >= 1 hit)
+# ============================================================================
+# Ten ad-hoc FT.SEARCH queries with 11-20 AND'd predicates each, verified on
+# redis-10000.aws-alon-7300.env0.qa.redislabs.com:10000 against a freshly
+# seeded idx:books (~228k docs). None use @geo (would crash the shard) or
+# format() with non-%s (would error).
+#
+# Important quirks discovered on this cluster:
+#   - @geo:[...] filters crash the shard; avoid.
+#   - format() with %d / %.2f returns SEARCH_PARSE_ARGS; use %s only.
+#   - MINPREFIX >= 2: single-char prefix clauses like @field:a* silently return 0.
+#   - TAG sets: "non-fiction" must be written non\-fiction (hyphen = negation).
+#   - TEXT fields are indexed without infix/suffix, only prefix (term*).
+#   - @field:(a*|b*) is intra-field OR. `@f:a* @f:b*` is AND, not OR.
+# ============================================================================
+
+# ------- q_int_01_classic_hardcover_bestseller -------
+# 15 predicates: available hardcover multi-genre + english&(de|fr) editions,
+# price/year/score/votes/pages/translations/chapters/word-count windows, no 'gore'.
+# Expected: ~11 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@format:{hardcover}) (@genres:{fantasy|science\ fiction|fiction}) (@editions:{english}) (@editions:{german|french}) (@status:{for_sale|available}) (@price:[10 90]) (@year_published:[1990 2023]) (@score:[3.5 5]) (@rating_votes:[50 +inf]) (@pages:[150 1200]) (@translations_count:[2 +inf]) (@chapter_count:[5 80]) (@word_count:[20000 250000]) -(@description:gore)' RETURN 6 title author year_published score rating_votes price SORTBY rating_votes DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_02_trilingual_top_seller -------
+# 18 predicates: english AND (spanish|french|italian|german), high global_sales,
+# multi-field physical-dimension existence checks.
+# Expected: ~23 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@format:{hardcover|ebook}) (@genres:{thriller|mystery}) (@editions:{english}) (@editions:{spanish|french|italian|german}) (@status:{for_sale}) (@price:[5 100]) (@year_published:[1970 2023]) (@score:[3 +inf]) (@rating_votes:[50 +inf]) (@pages:[100 1000]) (@global_sales:[1000 +inf]) (@translations_count:[1 +inf]) (@author_age_at_publication:[25 70]) (@weight_grams:[(0 +inf]) (@width_cm:[(0 +inf]) (@height_cm:[(0 +inf]) (@depth_cm:[(0 +inf])' RETURN 7 title author year_published score global_sales translations_count price SORTBY global_sales DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_03_negation_heavy_cleanread -------
+# 15 predicates, 6 of them negations (horror/true-crime/ebook/maintenance/
+# on_loan/Alon-Shmuely/violence/gore/torture). Note escaped hyphen: non\-fiction.
+# Expected: ~16 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) -(@genres:{horror|true\ crime}) -(@format:{ebook}) -(@status:{maintenance|on_loan}) -@author:"Alon Shmuely" -(@description:(violence|gore|torture)) (@genres:{fiction|non\-fiction|biography|history}) (@editions:{english}) (@price:[-inf 60]) (@year_published:[1950 2023]) (@score:[3.5 +inf]) (@rating_votes:[100 +inf]) (@pages:[(0 1500]) (@chapter_count:[5 80]) (@word_count:[10000 250000])' RETURN 6 title author genres format score rating_votes SORTBY score DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_04_text_intersect_titledescpub -------
+# 3 TEXT-field AND clauses on common description tokens + 10 structural predicates.
+# Expected: ~2 hits (very narrow triple-token intersection).
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '@description:time @description:story @description:year (@is_available:{True}) (@format:{paperback|hardcover}) (@editions:{english}) (@genres:{romance|drama|fiction}) (@price:[5 80]) (@year_published:[1960 2023]) (@score:[3 +inf]) (@rating_votes:[20 +inf]) (@pages:[80 1000]) (@chapter_count:[5 80]) (@word_count:[10000 250000])' RETURN 6 title author publisher genres year_published score SORTBY year_published DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_05_physical_dimensions_band -------
+# 19 predicates including tight numeric bands on every physical-dimension field.
+# Expected: ~19 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@format:{hardcover}) (@genres:{fantasy|science\ fiction|adventure}) (@editions:{english}) (@editions:{french|spanish|german}) (@status:{available|for_sale}) (@price:[15 150]) (@year_published:[1980 2023]) (@score:[3.5 +inf]) (@rating_votes:[50 +inf]) (@pages:[200 1500]) (@chapter_count:[10 80]) (@word_count:[30000 250000]) (@reading_time_minutes:[120 1200]) (@weight_grams:[200 2500]) (@width_cm:[5 30]) (@height_cm:[10 40]) (@depth_cm:[1 10]) (@translations_count:[1 +inf])' RETURN 7 title author pages weight_grams width_cm height_cm depth_cm SORTBY pages DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_06_parameterized_intersections -------
+# 14 predicates bound by 12 $params (PARAMS 24) with DIALECT 2.
+# Expected: ~56 hits (with the parameter values below).
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@format:{hardcover|paperback}) (@genres:{biography|history|fiction}) (@editions:{english}) (@editions:{german|french}) (@status:{for_sale|available}) (@price:[$p_lo $p_hi]) (@year_published:[$y_lo $y_hi]) (@score:[$s_lo +inf]) (@rating_votes:[$rv_lo +inf]) (@pages:[$pg_lo $pg_hi]) (@global_sales:[$gs_lo +inf]) (@author_age_at_publication:[$a_lo $a_hi]) (@translations_count:[$tx_lo +inf])' RETURN 7 title author year_published score global_sales price translations_count SORTBY global_sales DESC LIMIT 0 5 DIALECT 2 PARAMS 24 p_lo 5 p_hi 120 y_lo 1950 y_hi 2023 s_lo 3.0 rv_lo 50 pg_lo 80 pg_hi 1200 gs_lo 1000 a_lo 25 a_hi 80 tx_lo 1
+
+# ------- q_int_07_fivegenre_intersection -------
+# Pure tag intersection: 3 genre ANDs + 2 edition ANDs (english + union) + numerics.
+# Expected: ~5 hits (three-genre intersection is naturally very narrow).
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@genres:{fiction}) (@genres:{adventure}) (@genres:{history}) (@editions:{english}) (@editions:{french|spanish|german|italian}) (@price:[-inf 150]) (@year_published:[1900 2023]) (@score:[1 +inf]) (@rating_votes:[1 +inf]) (@pages:[(0 +inf])' RETURN 5 title author genres editions score SORTBY score DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_08_wide_numeric_grid -------
+# 20 predicates (17 numerics + 3 tags) -- every major numeric field bounded.
+# Expected: ~7007 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@format:{hardcover|paperback|ebook}) (@editions:{english}) (@price:[5 200]) (@year_published:[1900 2023]) (@score:[2 5]) (@rating_votes:[1 +inf]) (@pages:[20 2000]) (@chapter_count:[1 100]) (@review_count:[0 10000]) (@citation_count:[0 5000]) (@publishing_delay:[-400 1500]) (@word_count:[1000 500000]) (@reading_time_minutes:[10 5000]) (@global_sales:[0 +inf]) (@translations_count:[0 100]) (@edition_number:[1 10]) (@author_age_at_publication:[15 90]) (@weight_grams:[(0 +inf]) (@timestamp:[(0 +inf])' RETURN 5 title author year_published score rating_votes SORTBY timestamp DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_09_inventory_multistatus -------
+# Inventory status array intersection (status:{available} AND status:{for_sale})
+# plus 13 structural predicates.
+# Expected: ~38 hits.
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@is_available:{True}) (@status:{available}) (@status:{for_sale}) (@format:{hardcover|paperback}) (@genres:{drama|romance|biography|fiction}) (@editions:{english}) (@editions:{italian|french|german}) (@price:[8 100]) (@year_published:[1960 2023]) (@score:[3 +inf]) (@rating_votes:[50 +inf]) (@pages:[80 1200]) (@chapter_count:[5 80]) (@word_count:[15000 250000]) (@publishing_delay:[-200 800])' RETURN 6 title author genres format score price SORTBY score DESC LIMIT 0 5 DIALECT 2
+
+# ------- q_int_10_textfield_infix_intersect -------
+# Three TEXT-field PREFIX intersections (title/description/publisher), main_character
+# prefix union via @field:(al*|an*|jo*|ma*|ja*|da*), plus 11 structural predicates.
+# Expected: ~1 hit (very narrow four-field text intersection).
+redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.SEARCH idx:books '(@title:ye*) (@description:wo*) (@publisher:gr*) @main_character:(al*|an*|jo*|ma*|ja*|da*) (@is_available:{True}) (@genres:{fiction|romance|mystery|drama|biography|history|adventure|thriller|fantasy|science\ fiction|children'"'"'s\ literature}) (@editions:{english}) (@status:{for_sale|available|on_loan}) (@price:[-inf 150]) (@year_published:[1950 2023]) (@score:[1 +inf]) (@rating_votes:[1 +inf]) (@pages:[50 1500]) (@chapter_count:[1 100]) (@word_count:[5000 500000])' RETURN 6 title author publisher main_character score year_published SORTBY score DESC LIMIT 0 5 DIALECT 2
+
+
+# ---- 5. Extra diagnostic commands -----------------------------------------
+
+# Explain the query plan (swap QUERY for any of the SEARCH strings above):
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.EXPLAIN idx:books '(@genres:{fantasy})'
+
+# Profile a search (returns real results plus execution stats):
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.PROFILE idx:books SEARCH LIMITED QUERY '(@genres:{fantasy})'
+
+# Profile an aggregate:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.PROFILE idx:books AGGREGATE QUERY '*' GROUPBY 1 @format REDUCE COUNT 0 AS c
+
+# List all TAG values of a field (fast facet):
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.TAGVALS idx:books genres
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.TAGVALS idx:books editions
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.TAGVALS idx:books status
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.TAGVALS idx:books format
+
+# Dump current module config:
+# redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT.CONFIG GET '*'
+
+# Watch for LOADING state while you debug a crash:
+# while true; do redis-cli -h redis-10000.aws-alon-7300.env0.qa.redislabs.com -p 10000 FT._LIST; sleep 5; done
